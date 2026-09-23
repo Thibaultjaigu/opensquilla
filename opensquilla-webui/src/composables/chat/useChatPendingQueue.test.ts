@@ -1,4 +1,4 @@
-import { nextTick, ref } from 'vue'
+import { nextTick, reactive, ref, toRaw } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
@@ -11,6 +11,7 @@ import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
 import type { Attachment, ChatPendingItem, HiddenControlDispatchResult } from '@/types/chat'
+import { ParkedPendingQueueCache } from '@/utils/chat/parkedPendingQueueCache'
 import {
   createPendingInputWal,
   type PendingInputWal,
@@ -213,6 +214,97 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
   }
   return { records, handoffs, wal }
 }
+
+describe('parked queue Vue boundary', () => {
+  const cache = () => new ParkedPendingQueueCache({
+    unwrapObject: toRaw, isPinned: () => false, isUrlRetained: () => false,
+  })
+
+  it.each([false, true])('preserves commit identity across raw/proxy boundaries (commit proxy=%s)', commitProxy => {
+    const target = cache()
+    const raw: ChatPendingItem = { pendingUiId: 'proxy-draft', pendingInputId: 'proxy-draft',
+      text: 'x'.repeat(9 * 1024 * 1024), intent: null, attachments: [] }
+    const proxy = reactive(raw)
+    const committed = commitProxy ? proxy : raw
+    target.rememberCommitted(committed, target.snapshotForCommit(committed))
+    target.set('synthetic-session', [commitProxy ? raw : proxy])
+    expect(target.size).toBe(0)
+  })
+
+  it('counts nested raw/proxy aliases and their shared Blob once per session', () => {
+    const attachment: Attachment = { kind: 'staged', local_id: 1, name: 'synthetic.txt', mime: 'text/plain',
+      file: new File(['synthetic bytes'], 'synthetic.txt') }
+    const raw: ChatPendingItem = { pendingUiId: 'shared-blob', text: 'draft', intent: null,
+      attachments: [attachment, attachment] }
+    const plain = cache()
+    plain.set('synthetic-session', [raw, raw])
+    const mixed = cache()
+    mixed.set('synthetic-session', [raw, reactive(raw)])
+    expect(mixed.usage()).toEqual(plain.usage())
+    expect(mixed.usage().blobBytes).toBe(attachment.file!.size)
+    expect(toRaw(mixed.get('synthetic-session')![1]!)).toBe(raw)
+  })
+})
+
+it('bounds 500 parked sessions and restores an evicted draft with its original WAL identities', async () => {
+  const { wal, records } = memoryWal()
+  const h = makeQueue(undefined, () => true, undefined, undefined, { pendingInputWal: wal })
+  const firstSession = h.sessionKey.value
+  let firstId = ''
+  try {
+    for (let i = 0; i < 500; i++) {
+      expect(await h.queue.enqueuePendingPayload({ text: `Synthetic draft ${i}`, draftIds: [`draft-${i}`] })).toBe(true)
+      if (i === 0) firstId = h.queue.pendingQueue.value[0]!.pendingInputId!
+      const next = `agent:main:webchat:cache-${i + 1}`
+      await h.queue.switchPendingQueue(next)
+      h.sessionKey.value = next
+      await nextTick()
+      for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    }
+    expect(h.queue.getParkedQueueUsage()).toMatchObject({ sessions: 16, protectedSessions: 0 })
+    expect(records.size).toBe(500)
+    const original = structuredClone(records.get(firstId))
+    await h.queue.switchPendingQueue(firstSession)
+    h.sessionKey.value = firstSession
+    await nextTick()
+    await h.queue.hydratePendingQueue(firstSession)
+    expect(h.queue.pendingQueue.value).toHaveLength(1)
+    expect(h.queue.pendingQueue.value[0]).toMatchObject({
+      pendingInputId: firstId, text: 'Synthetic draft 0', draftIds: ['draft-0'],
+      pendingClientRequestId: original!.clientRequestId,
+      pendingClientMessageId: original!.clientMessageId,
+    })
+    expect(wal.delete).not.toHaveBeenCalled()
+  } finally { h.queue.cleanup() }
+})
+
+it('retains an inactive in-flight delivery under cache pressure without changing its object identity', async () => {
+  const h = makeQueue(undefined, () => true)
+  const firstSession = h.sessionKey.value
+  try {
+    expect(await h.queue.enqueuePendingPayload({ text: 'Synthetic in-flight input' })).toBe(true)
+    const id = h.queue.pendingQueue.value[0]!.pendingUiId!
+    const active = h.queue.beginPendingDelivery(id)!
+    expect(active).toBeTruthy()
+    for (let i = 0; i < 25; i++) {
+      const next = `agent:main:webchat:pinned-${i}`
+      await h.queue.switchPendingQueue(next)
+      h.sessionKey.value = next
+      await nextTick()
+      expect(await h.queue.enqueuePendingPayload({ text: `Other synthetic draft ${i}` })).toBe(true)
+      for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    }
+    expect(h.queue.getParkedQueueUsage().protectedSessions).toBe(1)
+    await h.queue.switchPendingQueue(firstSession)
+    h.sessionKey.value = firstSession
+    await nextTick()
+    await h.queue.hydratePendingQueue(firstSession)
+    expect(h.queue.pendingQueue.value[0]).toBe(active)
+    expect(h.queue.pendingQueue.value[0]?.text).toBe('Synthetic in-flight input')
+    h.queue.settlePendingDelivery(active, 'deferred')
+    expect(h.queue.pendingQueue.value[0]?.deliveryState).toBeUndefined()
+  } finally { h.queue.cleanup() }
+})
 
 class TestBroadcastChannel {
   static readonly channels = new Map<string, Set<TestBroadcastChannel>>()
@@ -3073,4 +3165,153 @@ it('does not replace a queued skill identity with a conflicting server projectio
       pendingPersistenceState: 'retryable',
     })
   } finally { result.queue.cleanup() }
+})
+
+it('completes a handoff with an unrelated parked queue', async () => {
+  const { wal } = memoryWal()
+  const h = makeQueue(undefined, () => true, undefined, undefined, { pendingInputWal: wal })
+  let visits = 0
+  let guard: ReturnType<typeof vi.spyOn> | undefined
+  try {
+    await h.queue.enqueuePendingPayload({ text: 'synthetic unrelated draft' })
+    const originalSession = h.sessionKey.value
+    await h.queue.switchPendingQueue('agent:main:webchat:other')
+    h.sessionKey.value = 'agent:main:webchat:other'
+    await nextTick()
+    await wal.putHandoff!({ schemaVersion: 1, ownerRequestId: 'synthetic-handoff',
+      requestSessionKey: h.sessionKey.value, clientRequestId: 'synthetic-handoff',
+      clientMessageId: 'synthetic-message', composerText: 'synthetic fork', recoveryAttachments: [],
+      params: { sessionKey: h.sessionKey.value, message: 'synthetic fork' },
+      state: 'submitting', createdAt: 1, updatedAt: 1 })
+    const original = ParkedPendingQueueCache.prototype.set
+    guard = vi.spyOn(ParkedPendingQueueCache.prototype, 'set').mockImplementation(function(this: ParkedPendingQueueCache, key, items) {
+      if (key === originalSession && ++visits > 4) throw new Error('Synchronous handoff loop revisited the same unrelated queue more than four times')
+      return original.call(this, key, items)
+    })
+    await expect(h.queue.recoverPendingQueueHandoff(h.sessionKey.value,
+      'agent:main:webchat:child', 'synthetic-handoff')).resolves.toBeUndefined()
+    expect(visits).toBe(1)
+    await h.queue.switchPendingQueue(originalSession)
+    h.sessionKey.value = originalSession
+    await nextTick()
+    expect(h.queue.pendingQueue.value).toEqual([expect.objectContaining({ text: 'synthetic unrelated draft' })])
+  } finally { guard?.mockRestore(); h.queue.cleanup() }
+})
+
+it('retains attachment URLs while an accepted handoff releases a parked queue under pressure', async () => {
+  const parent = 'agent:main:webchat:test'
+  const target = 'agent:main:webchat:pinned-0'
+  const ownerRequestId = 'synthetic-attachment-handoff'
+  const records: PendingInputWalRecord[] = [parent, ...Array.from({ length: 16 }, (_, i) => (
+    `agent:main:webchat:pinned-${i}`
+  ))].map((sessionKey, index) => ({
+    schemaVersion: 1, pendingInputId: `synthetic-pending-${index}`, sessionKey,
+    clientRequestId: `synthetic-request-${index}`, clientMessageId: `synthetic-message-${index}`,
+    ownerRequestId: index === 0 ? ownerRequestId : `synthetic-pinned-owner-${index}`,
+    text: 'Synthetic protected draft', intent: null, state: 'local_only', mayHaveServerCopy: false,
+    attachments: index === 0 ? [{ kind: 'staged', local_id: 1, name: 'synthetic.txt',
+      mime: 'text/plain', dataUrl: 'blob:previous-renderer',
+      file: new File(['Synthetic attachment'], 'synthetic.txt') }] : [],
+    createdAt: 1, updatedAt: 1,
+  }))
+  const { wal } = memoryWal(records)
+  let urlCount = 0
+  const create = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:handoff-${++urlCount}`)
+  const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+  const h = makeQueue(undefined, () => true, undefined, undefined, {
+    pendingInputWal: wal, connectionState: ref('disconnected'),
+  })
+  try {
+    await h.queue.hydratePendingQueue(parent)
+    for (const sessionKey of [...records.slice(1).map(record => record.sessionKey), 'agent:main:webchat:empty']) {
+      await h.queue.switchPendingQueue(sessionKey)
+      h.sessionKey.value = sessionKey
+      await nextTick()
+      await h.queue.hydratePendingQueue(sessionKey)
+    }
+    expect(h.queue.getParkedQueueUsage()).toMatchObject({ sessions: 17, protectedSessions: 17 })
+    await wal.putHandoff!({ schemaVersion: 1, ownerRequestId, requestSessionKey: parent,
+      clientRequestId: ownerRequestId, clientMessageId: 'synthetic-handoff-message',
+      composerText: 'Synthetic fork', recoveryAttachments: [],
+      params: { sessionKey: parent, message: 'Synthetic fork' },
+      state: 'submitting', createdAt: 1, updatedAt: 1 })
+    await h.queue.recoverPendingQueueHandoff(parent, target, ownerRequestId)
+    expect(h.queue.getParkedQueueUsage().sessions).toBe(16)
+    await h.queue.switchPendingQueue(target)
+    h.sessionKey.value = target
+    await nextTick()
+    const moved = h.queue.pendingQueue.value.find(item => item.pendingInputId === 'synthetic-pending-0')!
+    expect(moved).toBeDefined()
+    expect(moved.ownerSessionKey).toBe(target)
+    expect(moved.attachments[0]?.dataUrl).toMatch(/^blob:handoff-/)
+    expect(revoke).not.toHaveBeenCalledWith(moved.attachments[0]!.dataUrl)
+  } finally { h.queue.cleanup(); create.mockRestore(); revoke.mockRestore() }
+})
+
+
+it.each([
+  ['recover', 'before'], ['recover', 'after'],
+  ['adopt', 'before'], ['adopt', 'after'],
+] as const)('keeps a %s handoff durable without restoring a disposed queue (%s commit)', async (path, timing) => {
+  const parent = 'agent:main:webchat:test'
+  const child = 'agent:main:webchat:disposed-child'
+  const ownerRequestId = 'synthetic-disposed-handoff'
+  const { wal, records, handoffs } = memoryWal([{
+    schemaVersion: 1, pendingInputId: 'synthetic-disposed-pending', sessionKey: parent,
+    clientRequestId: 'synthetic-disposed-pending-request', clientMessageId: 'synthetic-disposed-pending-message',
+    ownerRequestId, text: 'Synthetic handoff follow-up', intent: null, state: 'local_only',
+    attachments: [{ kind: 'staged', local_id: 1, name: 'synthetic.txt', mime: 'text/plain',
+      dataUrl: 'blob:synthetic-previous-page', file: new File(['Synthetic handoff bytes'], 'synthetic.txt') }],
+    createdAt: 1, updatedAt: 1,
+  }])
+  await wal.putHandoff!({ schemaVersion: 1, ownerRequestId, requestSessionKey: parent,
+    clientRequestId: ownerRequestId, clientMessageId: 'synthetic-disposed-message',
+    composerText: 'Synthetic fork', recoveryAttachments: [],
+    params: { sessionKey: parent, message: 'Synthetic fork' },
+    state: 'submitting', createdAt: 1, updatedAt: 1 })
+  const createUrl = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => 'blob:synthetic-disposed')
+  const revokeUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+  const h = makeQueue(undefined, () => true, undefined, undefined, {
+    pendingInputWal: wal, connectionState: ref('disconnected'),
+  })
+  let replacement: ReturnType<typeof makeQueue> | undefined
+  try {
+    await h.queue.hydratePendingQueue(parent)
+    const accept = wal.acceptHandoff!
+    let release!: () => void
+    let waiting = false
+    wal.acceptHandoff = async (...args) => {
+      const committed = timing === 'after' ? await accept(...args) : null
+      waiting = true
+      await new Promise<void>(resolve => { release = resolve })
+      return committed || accept(...args)
+    }
+    const recovering = path === 'recover'
+      ? h.queue.recoverPendingQueueHandoff(parent, child, ownerRequestId)
+      : h.queue.adoptPendingQueue(child, ownerRequestId)
+    await vi.waitFor(() => expect(waiting).toBe(true))
+    h.queue.cleanup()
+    const snapshot = JSON.stringify(h.queue.pendingQueue.value)
+    const createdBefore = createUrl.mock.calls.length
+    expect(createdBefore).toBeGreaterThan(0)
+    release()
+    await recovering
+    expect(JSON.stringify(h.queue.pendingQueue.value)).toBe(snapshot)
+    expect(h.queue.getParkedQueueUsage().sessions).toBe(0)
+    expect(createUrl).toHaveBeenCalledTimes(createdBefore)
+    expect(records.get('synthetic-disposed-pending')).toMatchObject({ sessionKey: child, ownerRequestId: undefined })
+    expect(handoffs.get(ownerRequestId)).toMatchObject({ state: 'accepted', acceptedSessionKey: child })
+
+    wal.acceptHandoff = accept
+    replacement = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('disconnected'),
+    })
+    replacement.sessionKey.value = child
+    await replacement.queue.hydratePendingQueue(child)
+    expect(replacement.queue.pendingQueue.value).toHaveLength(1)
+    const restored = replacement.queue.pendingQueue.value[0]!
+    expect(restored).toMatchObject({ text: 'Synthetic handoff follow-up', ownerSessionKey: child })
+    expect(restored.ownerRequestId).toBeUndefined()
+    expect(await restored.attachments[0]!.file!.text()).toBe('Synthetic handoff bytes')
+  } finally { h.queue.cleanup(); replacement?.queue.cleanup(); createUrl.mockRestore(); revokeUrl.mockRestore() }
 })

@@ -1,6 +1,6 @@
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
 import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
-import { computed, nextTick, ref, watch, type Ref } from 'vue'
+import { computed, nextTick, ref, toRaw, watch, type Ref } from 'vue'
 import type {
   Attachment,
   ChatPendingItem,
@@ -27,6 +27,7 @@ import {
   type PendingInputServerItem,
 } from '@/modules/pendingInputQueue'
 import { snapshotSteerRequest } from './useChatSteerDelivery'
+import { ParkedPendingQueueCache } from '@/utils/chat/parkedPendingQueueCache'
 
 const MAX_PENDING = 5
 const MAX_REMOVAL_TOMBSTONES = 256
@@ -175,7 +176,18 @@ export interface UseChatPendingQueueOptions {
 export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const pendingInputQueue = options.pendingInputQueue
   const pendingQueue = ref<ChatPendingItem[]>([])
-  const parkedQueues = new Map<string, ChatPendingItem[]>()
+  const parkedQueues: ParkedPendingQueueCache = new ParkedPendingQueueCache({
+    unwrapObject: toRaw,
+    isPinned: item => Boolean(item.hiddenControl || item.steerAttempt || item.deliveryState
+      || item.ownerRequestId || item.pendingPersistenceState === 'cancelling' || (item.pendingInputId && (
+        locallyCreatingIds.has(item.pendingInputId) || stagingOperations.has(item.pendingInputId)
+        || cancellationOperations.has(item.pendingInputId)
+      )) || pendingQueue.value.some(active => toRaw(active) === toRaw(item))),
+    isUrlRetained: url => [options.pendingAttachments.value,
+      ...pendingQueue.value.map(item => item.attachments),
+      ...[...parkedQueues.values()].flat().map(item => item.attachments),
+    ].some(attachments => attachments.some(attachment => attachment.dataUrl === url)),
+  })
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
   let deferredDrainRequested = false
   const isReordering = ref(false)
@@ -329,7 +341,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       // when they met an older Gateway. No legacy state can therefore prove
       // that an enqueue never committed; only a newly persisted false bit can.
       : true
-    return {
+    const item = {
       pendingUiId: record.pendingInputId,
       text: record.text,
       ...((record.retiredAnnotationInput || record.promptAnnotationIds?.length)
@@ -339,7 +351,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(normalizeAnnotationDraftIds(record.draftIds).length
         ? { draftIds: normalizeAnnotationDraftIds(record.draftIds) }
         : {}),
-      attachments: record.attachments.map(snapshotAttachment),
+      attachments: record.attachments.map(attachment => parkedQueues.restoreAttachment(snapshotAttachment(attachment))),
       intent: record.intent,
       ...(record.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ownerSessionKey: record.sessionKey,
@@ -363,6 +375,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       pendingWalRevision: record.walRevision ?? 1,
       pendingCreatedAt: record.createdAt,
     } as ChatPendingItem
+    parkedQueues.rememberCommitted(item, parkedQueues.snapshotForCommit(item))
+    return item
   }
 
   function removedIdentity(sessionKey: string, pendingInputId: string): string {
@@ -436,11 +450,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const writeRevision = (previousWalRevision ?? 0) + 1
     if (!publishStateAfterCommit) trackedItem.pendingPersistenceState = state
     trackedItem.pendingWalRevision = writeRevision
+    const cacheSnapshot = parkedQueues.snapshotForCommit({ ...trackedItem, pendingPersistenceState: state })
     try {
       await options.pendingInputWal.put(walRecordForItem(trackedItem, state))
       if (publishStateAfterCommit && trackedItem.pendingWalRevision === writeRevision) {
         trackedItem.pendingPersistenceState = state
       }
+      parkedQueues.rememberCommitted(trackedItem, cacheSnapshot)
     } catch (error) {
       trackedItem.pendingWalRevision = previousWalRevision
       throw error
@@ -679,6 +695,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       }
     })().finally(() => {
       stagingOperations.delete(pendingInputId)
+      parkedQueues.trim()
     })
     stagingOperations.set(pendingInputId, operation)
     return operation
@@ -1018,6 +1035,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         return false
       } finally {
         locallyCreatingIds.delete(item.pendingInputId!)
+        parkedQueues.trim()
       }
       broadcastChange(item.ownerSessionKey || options.sessionKey.value)
       void ensureServerStaged(item)
@@ -1318,6 +1336,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return true
     }).finally(() => {
       cancellationOperations.delete(pendingInputId)
+      parkedQueues.trim()
     })
     cancellationOperations.set(pendingInputId, operation)
     return operation
@@ -1401,11 +1420,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         // The accepted server receipt is authoritative. A failed local delete
         // is reconciled against the now-missing server row on next hydrate.
       })
+      parkedQueues.trim()
       flushDeferredPendingDrain()
       return
     }
     if (outcome === 'deferred' && !item.steerAttempt) {
       item.deliveryState = undefined
+      parkedQueues.trim()
       deferredDrainRequested = true
       flushDeferredPendingDrain()
       return
@@ -1413,6 +1434,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (!item.steerAttempt) {
       item.deliveryState = outcome === 'retryable_failure' ? 'retryable' : undefined
     }
+    parkedQueues.trim()
     flushDeferredPendingDrain()
   }
 
@@ -1457,11 +1479,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   ): void | Promise<void> {
     if (reorderCommitPromise) {
       return reorderCommitPromise.then(() => {
-        if (!shouldCommit()) return
+        if (disposed || !shouldCommit()) return
         return switchPendingQueue(targetSessionKey, shouldCommit, handoffSignal)
       })
     }
-    if (!shouldCommit()) return
+    if (disposed || !shouldCommit()) return
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
@@ -1478,6 +1500,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const restored = parkedQueues.get(targetSessionKey) || []
     parkedQueues.delete(targetSessionKey)
     pendingQueue.value = restored
+    parkedQueues.trim()
     nextTick(() => void hydratePendingQueue(targetSessionKey))
   }
 
@@ -1498,12 +1521,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       if (!committed) return [item]
       Object.assign(item, committed)
       item.ownerRequestId = undefined
+      parkedQueues.rememberCommitted(item, parkedQueues.snapshotForCommit(item))
       committedById.delete(committed.pendingInputId!)
       migrated.push(item)
       return []
     })
     pendingQueue.value = updateOwned(pendingQueue.value)
-    for (const [sessionKey, items] of parkedQueues) {
+    // Updating the LRU cache reinserts keys; a live Map iterator would revisit them.
+    for (const [sessionKey, items] of [...parkedQueues]) {
       const retained = updateOwned(items)
       if (retained.length > 0) parkedQueues.set(sessionKey, retained)
       else parkedQueues.delete(sessionKey)
@@ -1522,13 +1547,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     shouldApply: () => boolean = () => true,
     handoffSignal?: AbortSignal,
   ): Promise<boolean> {
-    if (!options.pendingInputWal?.acceptHandoff) return false
+    if (disposed || !options.pendingInputWal?.acceptHandoff) return false
     if (options.pendingInputWal.listHandoffs) {
       const records = await options.pendingInputWal.listHandoffs()
-      if (!shouldApply()) return false
+      if (disposed || !shouldApply()) return false
       if (!records.some(record => record.ownerRequestId === ownerRequestId)) return false
     }
-    if (!shouldApply()) return false
+    if (disposed || !shouldApply()) return false
     const commit = await options.pendingInputWal.acceptHandoff(
       ownerRequestId,
       targetSessionKey,
@@ -1536,7 +1561,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       handoffSignal,
     )
     if (!commit) return false
-    if (shouldApply()) {
+    // A WAL transaction already in progress may finish after page cleanup.
+    // Its committed rows belong to the next queue owner; do not reconstruct
+    // attachments or install them into this disposed page's cache.
+    if (!disposed && shouldApply()) {
       applyAcceptedHandoffCommit(commit, targetSessionKey, ownerRequestId)
     }
     return true
@@ -1547,9 +1575,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     targetSessionKey: string,
     ownerRequestId: string,
   ): Promise<void> {
-    if (!sourceSessionKey || !targetSessionKey || !ownerRequestId) return
+    if (disposed || !sourceSessionKey || !targetSessionKey || !ownerRequestId) return
     const committed = await acceptDurableHandoff(targetSessionKey, ownerRequestId)
-    if (!committed) return
+    if (!committed || disposed) return
     if (options.sessionKey.value === targetSessionKey) {
       const restored = parkedQueues.get(targetSessionKey) || []
       parkedQueues.delete(targetSessionKey)
@@ -1580,9 +1608,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     shouldCommit: () => boolean = () => true,
     handoffSignal?: AbortSignal,
   ) {
+    if (disposed) return
     if (reorderCommitPromise) await reorderCommitPromise
     else cancelPendingReorder()
-    if (!shouldCommit()) return
+    if (disposed || !shouldCommit()) return
     const sourceSessionKey = options.sessionKey.value
     const durableCommitApplied = await acceptDurableHandoff(
       targetSessionKey,
@@ -1590,7 +1619,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       shouldCommit,
       handoffSignal,
     )
-    if (!shouldCommit()) return
+    if (disposed || !shouldCommit()) return
     // The source queue still owns its terminal drain signal until the durable
     // handoff has committed and this epoch is current. Clearing it before the
     // await would strand A if IndexedDB failed or A→B was superseded by A.
@@ -1633,6 +1662,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const targetItems = parkedQueues.get(targetSessionKey) || []
     parkedQueues.delete(targetSessionKey)
     pendingQueue.value = [...targetItems, ...carried]
+    parkedQueues.trim()
     sortOrdinaryPendingItems()
     for (const item of pendingQueue.value) {
       if (item.ownerSessionKey === targetSessionKey) void ensureServerStaged(item)
@@ -2052,6 +2082,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       item.pendingServerRevision = Number(serverItem.revision)
       item.pendingWalRevision = (item.pendingWalRevision ?? 0) + 1
     }
+    const cacheCommits = pendingQueue.value.map(item => ({
+      item, snapshot: parkedQueues.snapshotForCommit(item),
+    }))
     if (!options.pendingInputWal?.putMany) {
       for (const item of pendingQueue.value) {
         await options.pendingInputWal?.put(walRecordForItem(item, 'staged'))
@@ -2060,6 +2093,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       await options.pendingInputWal.putMany(
         pendingQueue.value.map(item => walRecordForItem(item, 'staged')),
       )
+    }
+    if (options.pendingInputWal) {
+      for (const commit of cacheCommits) parkedQueues.rememberCommitted(commit.item, commit.snapshot)
     }
   }
 
@@ -2139,6 +2175,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           const record = byId.get(item.pendingInputId!)!
           item.pendingPosition = record.position
           item.pendingWalRevision = record.walRevision
+          parkedQueues.rememberCommitted(item, parkedQueues.snapshotForCommit(item))
         }
         broadcastChange(options.sessionKey.value)
       } catch {
@@ -2200,13 +2237,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     disposed = true
     hydrateGeneration += 1
     clearPendingDrainAfterTerminalTimer()
-    parkedQueues.clear()
+    parkedQueues.dispose()
     broadcast?.close()
     options.pendingInputWal?.close()
   }
 
   return {
     pendingQueue,
+    getParkedQueueUsage: () => parkedQueues.usage(),
     canQueueMore,
     canReorder,
     busySendMode,

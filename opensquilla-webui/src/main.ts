@@ -12,6 +12,9 @@ import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
 import { SESSION_ROUTING_KEY } from './modules/sessionRouting'
 import { TURN_COMMANDS_KEY } from './modules/turnCommands'
+import { DURABLE_DELIVERY_KEY } from './modules/delivery'
+import { createDurableDelivery } from './runtime/durableDelivery'
+import { createPendingInputWal } from './utils/chat/pendingInputWal'
 import { PENDING_INPUT_QUEUE_KEY } from './modules/pendingInputQueue'
 import { APPROVAL_CENTER_KEY } from './modules/approvalCenter'
 import { GOAL_CENTER_KEY } from './modules/goalCenter'
@@ -69,6 +72,36 @@ rpcStore.init()
 const gatewayAdapters = createGatewayAdapters(rpcStore, {
   http: createPrivateHttpTransport(),
 })
+const durableDelivery = createDurableDelivery({
+  commands: gatewayAdapters.turnCommands,
+  wal: createPendingInputWal(),
+  access: {
+    identity: () => gatewayAdapters.gatewayAccess.deliveryIdentity,
+    available: () => gatewayAdapters.gatewayAccess.isAvailable
+      && gatewayAdapters.gatewayAccess.connectionPhase === 'healthy',
+    generation: () => gatewayAdapters.gatewayAccess.subscriptionEpoch,
+  },
+})
+const stopDeliveryWatch = watch(() => [
+  gatewayAdapters.gatewayAccess.deliveryIdentity,
+  gatewayAdapters.gatewayAccess.isAvailable,
+  gatewayAdapters.gatewayAccess.connectionPhase,
+  gatewayAdapters.gatewayAccess.subscriptionEpoch,
+], () => { void durableDelivery.wake() }, { immediate: true })
+const stopDeliveryEvents = gatewayAdapters.conversationEvents.subscribe({
+  onEvent(message) {
+    if (message.kind !== 'conversation' || message.event.semanticKind !== 'input-disposition') return
+    const event = message.event
+    const requestId = event.payload.client_request_id
+    if (!requestId) return
+    // This observer opens no session read or remote subscription. Only an
+    // authenticated semantic disposition can wake its exact pending receipt.
+    const token = JSON.stringify([event.payload.revision, event.payload.promoted_turn_id,
+      event.payload.target_turn_id, event.payload.disposition])
+    void durableDelivery.noteReceiptChanged(requestId, token).catch(() => {})
+  },
+})
+app.onUnmount(() => { stopDeliveryWatch(); stopDeliveryEvents(); durableDelivery.dispose() })
 appStore.bindAppSettings(gatewayAdapters.appSettings)
 watch(() => rpcStore.state, (state) => {
   if (state === 'connected' && appStore.pendingChannelNoticeLocale) {
@@ -95,7 +128,8 @@ app.provide(
   gatewayAdapters.sessionLifecycle,
 )
 app.provide(SESSION_ROUTING_KEY, gatewayAdapters.sessionRouting)
-app.provide(TURN_COMMANDS_KEY, gatewayAdapters.turnCommands)
+app.provide(TURN_COMMANDS_KEY, durableDelivery.commands)
+app.provide(DURABLE_DELIVERY_KEY, durableDelivery)
 app.provide(PENDING_INPUT_QUEUE_KEY, gatewayAdapters.pendingInputQueue)
 app.provide(APPROVAL_CENTER_KEY, gatewayAdapters.approvalCenter)
 app.provide(GOAL_CENTER_KEY, gatewayAdapters.goalCenter)

@@ -913,6 +913,7 @@ import {
 } from '@/modules/clarificationSubmission'
 import { SESSION_MAINTENANCE_KEY, type SessionMaintenance } from '@/modules/sessionMaintenance'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
+import { DURABLE_DELIVERY_KEY } from '@/modules/delivery'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
 import { GOAL_CONTINUITY_KEY, type GoalContinuity } from '@/modules/goalContinuity'
@@ -1250,6 +1251,9 @@ const sessionLifecycle = injectedSessionLifecycle
 const injectedTurnCommands = inject(TURN_COMMANDS_KEY)
 if (!injectedTurnCommands) throw new Error('TurnCommands was not provided')
 const turnCommands: TurnCommands = injectedTurnCommands
+const injectedDurableDelivery = inject(DURABLE_DELIVERY_KEY)
+if (!injectedDurableDelivery) throw new Error('DurableDelivery was not provided')
+const durableDelivery = injectedDurableDelivery
 const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
 if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
 const approvalCenter: ApprovalCenter = injectedApprovalCenter
@@ -1768,6 +1772,8 @@ const activeStreamTaskId = ref<string>('')
 const activeStreamSessionKey = ref<string>('')
 const acceptanceStopPending = ref(false)
 const acceptanceRecoveryPending = ref(false)
+const acceptanceStopAvailable = ref(false)
+const durableStopPending = ref(false)
 const taskOwnership = useChatTaskOwnership()
 const taskProgress = useChatTaskProgress({
   sessionKey, currentEpoch, activeTaskId: taskOwnership.stopTargetTaskId,
@@ -1776,7 +1782,7 @@ const ordinaryTaskProgress = taskProgress.progress
 const isStopPending = computed(() => (
   Boolean(taskOwnership.stopRequestedTaskId.value)
   || acceptanceStopPending.value
-  || acceptanceRecoveryPending.value
+  || (durableStopPending.value && !acceptanceStopAvailable.value && !taskOwnership.stopTargetTaskId.value)
 ))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
 let restoreLiveTurnSnapshot = (_snapshot: SessionReadSnapshot) => {}
@@ -2297,6 +2303,7 @@ const chatSessionModel = useChatSessionModel({
   isDraft: isDraftSurface,
   available: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  allowed: optionalSessionRpcAllowed,
 })
 const { modelName: storedSessionModelName } = chatSessionModel
 
@@ -3171,27 +3178,28 @@ const sessionHasActiveWork = computed(() => (
   || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
 ))
 const canStop = computed(() => (
-  !isSessionHydrating.value
-  && taskOwnership.hydrationResolved.value
-  && !taskOwnership.stopRequestedTaskId.value
+  !taskOwnership.stopRequestedTaskId.value
   && !acceptanceStopPending.value
-  && !acceptanceRecoveryPending.value
-  && (
-    Boolean(taskOwnership.stopTargetTaskId.value)
-    || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
-    || Boolean(
-      activeStreamTaskId.value
-      && ![
-        FINISHED_STREAM_TASK_ID,
-        STOPPED_STREAM_TASK_ID,
-      ].includes(activeStreamTaskId.value),
+  && (acceptanceStopAvailable.value || (
+    !isSessionHydrating.value
+    && taskOwnership.hydrationResolved.value
+    && (
+      Boolean(taskOwnership.stopTargetTaskId.value)
+      || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
+      || Boolean(
+        activeStreamTaskId.value
+        && ![
+          FINISHED_STREAM_TASK_ID,
+          STOPPED_STREAM_TASK_ID,
+        ].includes(activeStreamTaskId.value),
+      )
+      || isCompactInFlightForCurrentSession()
+      || activeTaskGroups.value.size > 0
+      || activePlanRun.value?.status === 'queued'
+      || activePlanRun.value?.status === 'running'
+      || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
     )
-    || isCompactInFlightForCurrentSession()
-    || activeTaskGroups.value.size > 0
-    || activePlanRun.value?.status === 'queued'
-    || activePlanRun.value?.status === 'running'
-    || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
-  )
+  ))
 ))
 const runModeLocked = computed(
   () => isSessionHydrating.value
@@ -3653,6 +3661,7 @@ const {
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
+  durableDelivery,
   selectedSkills,
   consumeAcceptedDraft: draftPersistence.consumeAcceptedDraft,
   captureAttachmentDraftConsumption: chatAttachments.captureDraftConsumption,
@@ -3668,6 +3677,9 @@ const chatSend = useChatSend({
     },
     cancel: (request, options) => turnCommands.cancel(request, options),
     steer: (request, options) => turnCommands.steer(request, options),
+    lookupReceipt: (request, options) => turnCommands.lookupReceipt?.(request, options)
+      || Promise.resolve({ status: 'unsupported' as const }),
+    supportsReceiptLookup: () => turnCommands.supportsReceiptLookup?.() ?? false,
     supports: capability => turnCommands.supports(capability),
   },
   activeSteerCapability,
@@ -3684,7 +3696,6 @@ const chatSend = useChatSend({
   initialRoutingMode,
   initialModel: newTaskModel.initialModel,
   initialProvider: newTaskModel.initialProvider,
-  restoreInitialModel: newTaskModel.restore,
   elevatedMode,
   runMode,
   pendingAttachments,
@@ -3746,9 +3757,12 @@ const chatSend = useChatSend({
   taskOwnership,
   acceptanceStopPending,
   acceptanceRecoveryPending,
+  acceptanceStopAvailable,
+  durableStopPending,
   autoScroll,
   stream: chatStream,
   canStop: () => canStop.value,
+  canStopKnownTask: () => !isSessionHydrating.value && taskOwnership.hydrationResolved.value,
   normalizeElevatedMode,
   adoptResponseSession: async (key, ownerRequestId) => {
     const sourceKey = sessionKey.value
@@ -7326,6 +7340,7 @@ watch(
 
 
 onUnmounted(() => {
+  chatSend.dispose()
   cancelDraftProjectChoice()
   window.removeEventListener('pointerup', onThreadPointerEnd)
   window.removeEventListener('pointercancel', onThreadPointerEnd)
